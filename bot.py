@@ -3,13 +3,11 @@ import html
 import logging
 import os
 import time
-from pathlib import Path
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, LinkPreviewOptions, Message
 
@@ -18,11 +16,8 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_URL = os.getenv("API_URL", "https://blackrussia.online/api/gameservers/")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "15"))  # секунд
-
-# Путь к фото в репозитории (рядом с bot.py)
-PHOTO_PATH = Path(__file__).with_name("brtools.png")
-# Опционально: прямая ссылка на raw-файл из GitHub, если нужно фото + длинный текст в 1 сообщении
-PHOTO_URL = os.getenv("PHOTO_URL")
+PHOTO_PATH = os.getenv("PHOTO_PATH", "brtools.png")
+PHOTO_URL = os.getenv("PHOTO_URL", "")  # Прямая ссылка на баннер для отправки большим превью
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -30,7 +25,6 @@ dp = Dispatcher()
 _cache = {"ts": 0.0, "data": None}
 _lock = asyncio.Lock()
 _session: aiohttp.ClientSession | None = None
-_photo_file_id: str | None = None
 
 
 async def fetch_servers() -> list[dict]:
@@ -68,49 +62,39 @@ def build_text(servers: list[dict]) -> str:
     )
 
 
-async def send_with_photo(m: Message, text: str):
-    global _photo_file_id
-
-    # Вариант 1: Если задана прямая ссылка PHOTO_URL — отправляем одним сообщением (до 4096 символов)
-    if PHOTO_URL:
-        await m.answer(
-            text,
-            link_preview_options=LinkPreviewOptions(
-                url=PHOTO_URL,
-                prefer_large_media=True,
-                show_above_text=True,
-            ),
-        )
-        return
-
-    # Вариант 2: Отправка локального файла brtools.png из репозитория
-    if not PHOTO_PATH.exists():
-        await m.answer(text)
-        return
-
-    photo = _photo_file_id or FSInputFile(PHOTO_PATH)
-    try:
-        sent = await m.answer_photo(photo=photo, caption=text)
-        if sent.photo:
-            _photo_file_id = sent.photo[-1].file_id
-    except TelegramBadRequest as e:
-        # Если текст длиннее 1024 символов (лимит подписи к фото в Telegram)
-        if "caption is too long" in str(e):
-            sent = await m.answer_photo(photo=photo)
-            if sent.photo:
-                _photo_file_id = sent.photo[-1].file_id
-            await m.answer(text)
-        else:
-            raise
-
-
 @dp.message(CommandStart())
+async def start(m: Message):
+    text = "Привет! Отправь /online, чтобы узнать онлайн серверов Black Russia."
+    if os.path.exists(PHOTO_PATH):
+        await m.answer_photo(FSInputFile(PHOTO_PATH), caption=text)
+    else:
+        await m.answer(text)
+
+
 @dp.message(Command("online"))
 @dp.message(F.text.func(lambda t: t.strip().lower() == "онлайн"))
 async def online(m: Message):
     try:
-        text = build_text(await fetch_servers())
-        await send_with_photo(m, text)
+        servers = await fetch_servers()
+        text = build_text(servers)
+
+        # 1. Если указана прямая ссылка на фото — прикрепляем его большим превью сверху текста (без ограничения длины)
+        if PHOTO_URL:
+            await m.answer(
+                f'<a href="{PHOTO_URL}">&#8203;</a>' + text,
+                link_preview_options=LinkPreviewOptions(
+                    is_disabled=False,
+                    url=PHOTO_URL,
+                    prefer_large_media=True,
+                    show_above_text=True,
+                ),
+            )
+        # 2. Если файл brtools.png лежит рядом и текст умещается в лимит подписи Telegram (1024 символа)
+        elif os.path.exists(PHOTO_PATH) and len(text) <= 1024:
+            await m.answer_photo(FSInputFile(PHOTO_PATH), caption=text)
+        # 3. Если серверов много (>1024 символов) и ссылки нет — отправляем текстом, чтобы Telegram не выдал ошибку
+        else:
+            await m.answer(text)
     except Exception:
         logging.exception("online failed")
         await m.answer("Не удалось получить онлайн, попробуй позже.")
