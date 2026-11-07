@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_URL = os.getenv("API_URL", "https://blackrussia.online/api/gameservers/")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "15"))  # секунд
-BRTOOLS_IMAGE_URL = os.getenv("BRTOOLS_IMAGE_URL", "")  # GitHub raw URL для brtools.png
+BRTOOLS_IMAGE_URL = "https://raw.githubusercontent.com/pfqj9vwvnm-prog/Jj/main/brtools.png"
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -65,23 +65,25 @@ async def send_online(m: Message):
     try:
         text = build_text(await fetch_servers())
 
-        # Telegram поддерживает URL изображения, в том числе GitHub raw.
-        # Если подпись слишком длинная, отправляем фото и текст отдельными сообщениями.
-        if BRTOOLS_IMAGE_URL:
-            try:
-                if len(text) <= 1024:
-                    await m.answer_photo(photo=BRTOOLS_IMAGE_URL, caption=text)
-                else:
-                    await m.answer_photo(photo=BRTOOLS_IMAGE_URL)
-                    await m.answer(text)
-            except Exception:
-                logging.exception("Не удалось отправить brtools.png, отправляю только текст")
-                await m.answer(text)
+        # Telegram ограничивает подпись к фото 1024 символами.
+        if len(text) <= 1024:
+            await m.answer_photo(photo=BRTOOLS_IMAGE_URL, caption=text)
         else:
+            # Если список серверов слишком длинный, фото всё равно отправляется,
+            # а полный список — следующим сообщением.
+            await m.answer_photo(
+                photo=BRTOOLS_IMAGE_URL,
+                caption="<b>BR Tools — онлайн серверов Black Russia</b>",
+            )
             await m.answer(text)
     except Exception:
-        logging.exception("online failed")
-        await m.answer("Не удалось получить онлайн, попробуй позже.")
+        logging.exception("Не удалось отправить фото или получить онлайн")
+        try:
+            # Резервный вариант: онлайн будет показан даже при ошибке с фото.
+            await m.answer(build_text(await fetch_servers()))
+        except Exception:
+            logging.exception("online failed")
+            await m.answer("Не удалось получить онлайн, попробуй позже.")
 
 
 @dp.message(CommandStart())
