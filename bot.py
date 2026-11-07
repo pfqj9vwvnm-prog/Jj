@@ -57,12 +57,12 @@ def build_caption(servers: list[dict]) -> str:
     footer = f"\n<b>Общий онлайн: {total}</b>"
 
     lines = []
-    for server in servers:
+    for index, server in enumerate(servers, 1):
         name = html.escape(str(server.get("name", "?")))
         online = int(server.get("online") or 0)
         maximum = int(server.get("max_online") or 0)
         multiplier = " x2" if server.get("x2") else ""
-        lines.append(f"{name}: {online}/{maximum}{multiplier}")
+        lines.append(f"{index}. {name}: {online}/{maximum}{multiplier}")
 
     # Reserve space for the heading, total and a possible "more servers" line.
     selected = []
