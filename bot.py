@@ -30,7 +30,7 @@ from aiogram.types import (
 
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 API_URL = os.getenv("API_URL", "https://blackrussia.online/api/gameservers/")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "15"))  # секунд
 DB_PATH = os.getenv("DB_PATH", "bot.db")
@@ -57,11 +57,11 @@ dp = Dispatcher()
 
 _cache = {"ts": 0.0, "data": None}
 _lock = asyncio.Lock()
-_session: aiohttp.ClientSession | None = None
-_photo_file_id: str | None = None
-_photo_uid: str | None = None  # file_unique_id фирменной картинки
-_x2_state: dict[str, bool] = {}
-BOT_USERNAME: str | None = None
+_session = None
+_photo_file_id = None
+_photo_uid = None  # file_unique_id фирменной картинки
+_x2_state = {}
+BOT_USERNAME = None
 
 
 # ---------- база данных ----------
@@ -90,31 +90,31 @@ db.executescript(
 db.commit()
 
 
-def run(sql: str, params=()):
+def run(sql, params=()):
     cur = db.execute(sql, params)
     db.commit()
     return cur
 
 
-def get_favs(uid: int) -> set[int]:
+def get_favs(uid):
     return {r[0] for r in db.execute("SELECT server_id FROM favs WHERE user_id=?", (uid,))}
 
 
-def toggle_fav(uid: int, sid: int) -> None:
+def toggle_fav(uid, sid):
     cur = db.execute("DELETE FROM favs WHERE user_id=? AND server_id=?", (uid, sid))
     if cur.rowcount == 0:
         db.execute("INSERT OR IGNORE INTO favs VALUES (?, ?)", (uid, sid))
     db.commit()
 
 
-def purge_chat(chat: int) -> None:
+def purge_chat(chat):
     db.execute("DELETE FROM alerts WHERE chat=?", (chat,))
     db.execute("DELETE FROM x2subs WHERE chat=?", (chat,))
     db.execute("DELETE FROM digest WHERE chat=?", (chat,))
     db.commit()
 
 
-def alert_limit(uid: int) -> tuple[int, int]:
+def alert_limit(uid):
     refs = db.execute("SELECT COUNT(*) FROM users WHERE referrer=?", (uid,)).fetchone()[0]
     return min(BASE_ALERTS + REF_BONUS * refs, MAX_ALERTS), refs
 
@@ -122,7 +122,7 @@ def alert_limit(uid: int) -> tuple[int, int]:
 # ---------- учёт пользователей и команд ----------
 
 
-def track(event) -> bool:
+def track(event):
     """Записывает пользователя и команду. Возвращает True, если пользователь новый."""
     user = event.from_user
     if not user or user.is_bot:
@@ -331,7 +331,7 @@ _BIZ_RE = re.compile(r"^(.+?)\s*(?:\((\d+)\)|#(\d+))\s*(?:-\s*(.*))?$")
 
 
 def _load_biz():
-    seen: dict[tuple[str, str], str] = {}
+    seen = {}
     for raw in BIZ_RAW.splitlines():
         line = raw.strip()
         if not line:
@@ -359,7 +359,7 @@ def _load_biz():
         if key not in used:
             logging.warning("business without category: %s", key)
 
-    by_num: dict[int, list[tuple[str, str, str]]] = {}
+    by_num = {}
     for _, items in cats:
         for name, tag, place in items:
             if tag.startswith("№"):
@@ -370,13 +370,13 @@ def _load_biz():
 BIZ, BIZ_BY_NUM = _load_biz()
 
 
-def biz_line(entry: tuple[str, str, str], mixed: bool) -> str:
+def biz_line(entry, mixed):
     name, tag, place = entry
     head = f"{name} {tag}" if mixed else tag
     return f"{head} — {place}" if place else head
 
 
-def paginate(lines: list[str], limit: int) -> list[list[str]]:
+def paginate(lines, limit):
     pages, cur, size = [], [], 0
     for ln in lines:
         add = len(ln) + 1
@@ -393,14 +393,14 @@ def paginate(lines: list[str], limit: int) -> list[list[str]]:
 # ---------- данные серверов ----------
 
 
-def num(v) -> int:
+def num(v):
     try:
         return int(v or 0)
     except (TypeError, ValueError):
         return 0
 
 
-async def fetch_servers(force: bool = False) -> list[dict]:
+async def fetch_servers(force=False):
     max_age = 3 if force else CACHE_TTL
     async with _lock:
         if _cache["data"] and time.monotonic() - _cache["ts"] < max_age:
@@ -425,27 +425,27 @@ async def fetch_servers(force: bool = False) -> list[dict]:
         return data
 
 
-def server_key(s: dict):
+def server_key(s):
     return s.get("id") if s.get("id") is not None else s.get("name")
 
 
-def total_online(servers: list[dict]) -> int:
+def total_online(servers):
     return sum(num(s.get("online")) for s in servers)
 
 
-def fmt_line(i: int, s: dict) -> str:
+def fmt_line(i, s):
     name = str(s.get("name", "?"))
     x = " x2" if s.get("x2") else ""
     return f"{i}. {name}: {num(s.get('online'))}/{num(s.get('max_online'))}{x}"
 
 
-def fmt_num_line(n: int, s: dict) -> str:
+def fmt_num_line(n, s):
     name = str(s.get("name", "?"))
     x = " x2" if s.get("x2") else ""
     return f"№{n} {name}: {num(s.get('online'))}/{num(s.get('max_online'))}{x}"
 
 
-def render_list(title: str, lines: list[str], footer: str, limit: int) -> str:
+def render_list(title, lines, footer, limit):
     """Список в раскрывающейся цитате. Режет с конца, только если не влезает в limit."""
     if not lines:
         lines = ["—"]
@@ -464,7 +464,7 @@ def render_list(title: str, lines: list[str], footer: str, limit: int) -> str:
     )
 
 
-def server_card(n: int, s: dict) -> str:
+def server_card(n, s):
     name = html.escape(str(s.get("name", "?")))
     x2 = "включён" if s.get("x2") else "нет"
     return (
@@ -492,11 +492,11 @@ ALIASES = {
 }
 
 
-def translit(s: str) -> str:
+def translit(s):
     return "".join(_TR.get(ch, ch) for ch in s.lower())
 
 
-def find_servers(servers: list[dict], q: str) -> list[tuple[int, dict]]:
+def find_servers(servers, q):
     """Возвращает [(номер в списке, сервер)]. Номер — как в /online."""
     q = q.strip().lstrip("№#").strip().lower()
     if not q:
@@ -516,7 +516,7 @@ def find_servers(servers: list[dict], q: str) -> list[tuple[int, dict]]:
     ]
 
 
-def ambiguous(found: list[tuple[int, dict]]) -> str:
+def ambiguous(found):
     lines = [f"№{n} {s.get('name', '?')}" for n, s in found[:8]]
     more = f"\n…и ещё {len(found) - 8}" if len(found) > 8 else ""
     return "Нашлось несколько серверов, укажи номер:\n" + html.escape("\n".join(lines)) + more
@@ -541,11 +541,11 @@ MENU_ORDER = ["online", "top", "free", "fav", "graph", "biz", "msg", "dg", "invi
 QUICK = ["online", "top", "fav", "graph"]
 
 
-def btn(text: str, data: str) -> InlineKeyboardButton:
+def btn(text, data):
     return InlineKeyboardButton(text=text, callback_data=data)
 
 
-def screen_kb(current: str, extra=None, refresh: bool = True, admin: bool = False) -> InlineKeyboardMarkup:
+def screen_kb(current, extra=None, refresh=True, admin=False):
     rows = list(extra or [])
     keys = MENU_ORDER if current == "menu" else QUICK
     items = [btn(NAV[k], f"nav:{k}") for k in keys if k != current]
@@ -602,14 +602,14 @@ GRAPH_EMPTY = (
 # ---------- отправка и редактирование ----------
 
 
-def remember_photo(sent: Message) -> None:
+def remember_photo(sent):
     global _photo_file_id, _photo_uid
     if sent.photo and not _photo_file_id:
         _photo_file_id = sent.photo[-1].file_id
         _photo_uid = sent.photo[-1].file_unique_id
 
 
-def is_brand(msg: Message) -> bool:
+def is_brand(msg):
     """True, если в сообщении фирменная картинка brtools.png (а не график)."""
     return (
         bool(msg.photo)
@@ -618,7 +618,7 @@ def is_brand(msg: Message) -> bool:
     )
 
 
-async def send_screen(m: Message, text: str, markup: InlineKeyboardMarkup | None, photo: bool):
+async def send_screen(m, text, markup, photo):
     """Одно сообщение: либо фото с подписью, либо обычный текст."""
     global _photo_file_id, _photo_uid
     if photo:
@@ -636,7 +636,7 @@ async def send_screen(m: Message, text: str, markup: InlineKeyboardMarkup | None
     await m.answer(text, reply_markup=markup)  # запасной вариант, чтобы бот не молчал
 
 
-async def push(chat_id: int, text: str, markup: InlineKeyboardMarkup | None = None):
+async def push(chat_id, text, markup=None):
     """Сообщение без входящего Message (для уведомлений): фото с подписью."""
     global _photo_file_id, _photo_uid
     try:
@@ -653,7 +653,7 @@ async def push(chat_id: int, text: str, markup: InlineKeyboardMarkup | None = No
     await bot.send_message(chat_id, text, reply_markup=markup)
 
 
-async def render(event, text: str, markup: InlineKeyboardMarkup | None, photo: bool):
+async def render(event, text, markup, photo):
     if not isinstance(event, CallbackQuery):
         await send_screen(event, text, markup, photo)
         return
@@ -685,11 +685,11 @@ async def render(event, text: str, markup: InlineKeyboardMarkup | None, photo: b
     await event.answer(toast)
 
 
-def uid_of(event) -> int:
+def uid_of(event):
     return event.from_user.id if event.from_user else 0
 
 
-def chat_of(event) -> int:
+def chat_of(event):
     if isinstance(event, CallbackQuery):
         return event.message.chat.id if event.message else uid_of(event)
     return event.chat.id
@@ -698,14 +698,14 @@ def chat_of(event) -> int:
 # ---------- бизнесы: экраны ----------
 
 
-def biz_kb() -> InlineKeyboardMarkup:
+def biz_kb():
     btns = [btn(f"{label} ({len(items)})", f"bc:{i}:0") for i, (label, items) in enumerate(BIZ)]
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
     rows.append([btn("← Назад", "nav:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_biz_cat(ci: int, page: int):
+def build_biz_cat(ci, page):
     label, items = BIZ[ci]
     mixed = len({e[0] for e in items}) > 1
     pages = paginate([biz_line(e, mixed) for e in items], BIZ_PAGE_CHARS)
@@ -727,7 +727,7 @@ def build_biz_cat(ci: int, page: int):
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def show_biz_cat(event, ci: int, page: int):
+async def show_biz_cat(event, ci, page):
     if not 0 <= ci < len(BIZ):
         ci = 0
     text, markup = build_biz_cat(ci, page)
@@ -737,17 +737,17 @@ async def show_biz_cat(event, ci: int, page: int):
 # ---------- уведомления, x2, сводка: экраны ----------
 
 
-def alert_hit(op: str, cur: int, val: int) -> bool:
+def alert_hit(op, cur, val):
     return cur < val if op == "-" else cur > val
 
 
-def alert_label(a) -> str:
+def alert_label(a):
     sign = "<" if a["op"] == "-" else ">"
     rep = " ∞" if a["repeat"] else ""
     return f"✕ {a['name']} {sign} {a['val']}{rep}"
 
 
-def build_alerts(chat: int, uid: int):
+def build_alerts(chat, uid):
     alerts = db.execute("SELECT * FROM alerts WHERE chat=? ORDER BY id", (chat,)).fetchall()
     subs = db.execute("SELECT * FROM x2subs WHERE chat=? ORDER BY id", (chat,)).fetchall()
     limit, _ = alert_limit(uid)
@@ -764,7 +764,7 @@ def build_alerts(chat: int, uid: int):
     return text, screen_kb("msg", extra=rows, refresh=False)
 
 
-def build_digest_screen(chat: int):
+def build_digest_screen(chat):
     row = db.execute("SELECT hour FROM digest WHERE chat=?", (chat,)).fetchone()
     status = f"включена, {row['hour']:02d}:00 МСК" if row else "выключена"
     text = (
@@ -775,14 +775,17 @@ def build_digest_screen(chat: int):
     )
     hours = [7, 9, 12, 15, 18, 21]
     cur = row["hour"] if row else None
-    btns = [btn(("✓ " if h == cur else "") + f"{h:02d}:00", f"dg:{h}") for h in hours]
+    btns = []
+    for h in hours:
+        mark = "✓ " if h == cur else ""
+        btns.append(btn(f"{mark}{h:02d}:00", f"dg:{h}"))
     rows = [btns[:3], btns[3:]]
     if row:
         rows.append([btn("✕ Выключить", "dg:off")])
     return text, screen_kb("dg", extra=rows, refresh=False)
 
 
-def set_digest(chat: int, hour: int) -> None:
+def set_digest(chat, hour):
     now = datetime.now(MSK)
     # если час уже наступил, первая сводка придёт завтра
     last = now.strftime("%Y-%m-%d") if now.hour >= hour else None
@@ -793,7 +796,7 @@ def set_digest(chat: int, hour: int) -> None:
     )
 
 
-def build_invite(uid: int):
+def build_invite(uid):
     limit, refs = alert_limit(uid)
     rows = []
     if BOT_USERNAME:
@@ -816,7 +819,7 @@ def build_invite(uid: int):
     return text, screen_kb("invite", extra=rows, refresh=False)
 
 
-def build_admin() -> str:
+def build_admin():
     now = int(time.time())
 
     def cnt(sql, *p):
@@ -829,34 +832,47 @@ def build_admin() -> str:
     cmds = db.execute(
         "SELECT cmd, n FROM cmdstats WHERE cmd NOT LIKE 'btn:%' ORDER BY n DESC LIMIT 6"
     ).fetchall()
-    top = "\n".join(
-        f"{'' if r['cmd'] == 'онлайн' else '/'}{html.escape(r['cmd'])}: {r['n']}" for r in cmds
-    ) or "—"
+    top_lines = []
+    for r in cmds:
+        prefix = "" if r["cmd"] == "онлайн" else "/"
+        top_lines.append(f"{prefix}{html.escape(r['cmd'])}: {r['n']}")
+    top = "\n".join(top_lines) or "—"
     try:
         size = os.path.getsize(DB_PATH) // 1024
     except OSError:
         size = 0
 
+    total_users = cnt("SELECT COUNT(*) FROM users")
+    new_24 = cnt("SELECT COUNT(*) FROM users WHERE first_seen>=?", now - 86400)
+    new_7 = cnt("SELECT COUNT(*) FROM users WHERE first_seen>=?", now - 7 * 86400)
+    act_24 = cnt("SELECT COUNT(*) FROM users WHERE last_seen>=?", now - 86400)
+    act_7 = cnt("SELECT COUNT(*) FROM users WHERE last_seen>=?", now - 7 * 86400)
+    invited = cnt("SELECT COUNT(*) FROM users WHERE referrer IS NOT NULL")
+    al_once = cnt("SELECT COUNT(*) FROM alerts WHERE repeat=0")
+    al_rep = cnt("SELECT COUNT(*) FROM alerts WHERE repeat=1")
+    x2_subs = cnt("SELECT COUNT(*) FROM x2subs")
+    digests = cnt("SELECT COUNT(*) FROM digest")
+    fav_users = cnt("SELECT COUNT(DISTINCT user_id) FROM favs")
+    btn_clicks = cnt("SELECT COALESCE(SUM(n), 0) FROM cmdstats WHERE cmd LIKE 'btn:%'")
+    hist_rows = cnt("SELECT COUNT(*) FROM history")
+
     lines = [
         "<b>Админ-панель</b>",
-        f"Пользователей: {cnt('SELECT COUNT(*) FROM users')}",
-        f"Новых за 24 ч / 7 дн: {cnt('SELECT COUNT(*) FROM users WHERE first_seen>=?', now - 86400)}"
-        f" / {cnt('SELECT COUNT(*) FROM users WHERE first_seen>=?', now - 7 * 86400)}",
-        f"Активных за 24 ч / 7 дн: {cnt('SELECT COUNT(*) FROM users WHERE last_seen>=?', now - 86400)}"
-        f" / {cnt('SELECT COUNT(*) FROM users WHERE last_seen>=?', now - 7 * 86400)}",
-        f"Пришли по приглашению: {cnt('SELECT COUNT(*) FROM users WHERE referrer IS NOT NULL')}",
+        f"Пользователей: {total_users}",
+        f"Новых за 24 ч / 7 дн: {new_24} / {new_7}",
+        f"Активных за 24 ч / 7 дн: {act_24} / {act_7}",
+        f"Пришли по приглашению: {invited}",
         "",
-        f"Уведомлений: {cnt('SELECT COUNT(*) FROM alerts WHERE repeat=0')} разовых, "
-        f"{cnt('SELECT COUNT(*) FROM alerts WHERE repeat=1')} повторных",
-        f"Подписок на x2: {cnt('SELECT COUNT(*) FROM x2subs')}",
-        f"Включённых сводок: {cnt('SELECT COUNT(*) FROM digest')}",
-        f"Пользователей с избранным: {cnt('SELECT COUNT(DISTINCT user_id) FROM favs')}",
+        f"Уведомлений: {al_once} разовых, {al_rep} повторных",
+        f"Подписок на x2: {x2_subs}",
+        f"Включённых сводок: {digests}",
+        f"Пользователей с избранным: {fav_users}",
         "",
-        f"Нажатий кнопок: {cnt(\"SELECT COALESCE(SUM(n), 0) FROM cmdstats WHERE cmd LIKE 'btn:%'\")}",
+        f"Нажатий кнопок: {btn_clicks}",
         "<b>Популярные команды</b>",
         top,
         "",
-        f"Записей истории: {cnt('SELECT COUNT(*) FROM history')}",
+        f"Записей истории: {hist_rows}",
         f"База: {size} КБ",
         f"Аптайм: {d} д {h} ч {mi} мин",
     ]
@@ -866,7 +882,7 @@ def build_admin() -> str:
 # ---------- график ----------
 
 
-def make_graph(points: list[tuple[int, int]]) -> bytes:
+def make_graph(points):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -896,7 +912,7 @@ def make_graph(points: list[tuple[int, int]]) -> bytes:
     return buf.getvalue()
 
 
-async def send_graph(event, png: bytes, caption: str, kb: InlineKeyboardMarkup):
+async def send_graph(event, png, caption, kb):
     media = BufferedInputFile(png, filename="online.png")
     if isinstance(event, CallbackQuery):
         msg = event.message
@@ -937,11 +953,13 @@ async def show_graph(event):
     peak = max(pts, key=lambda p: p[1])
     low = min(pts, key=lambda p: p[1])
     avg = sum(v for _, v in pts) // len(pts)
+    peak_t = datetime.fromtimestamp(peak[0], MSK).strftime("%H:%M")
+    low_t = datetime.fromtimestamp(low[0], MSK).strftime("%H:%M")
     caption = (
         "<b>Общий онлайн за 24 часа</b>\n"
         f"Сейчас: {pts[-1][1]}\n"
-        f"Пик: {peak[1]} ({datetime.fromtimestamp(peak[0], MSK):%H:%M} МСК)\n"
-        f"Минимум: {low[1]} ({datetime.fromtimestamp(low[0], MSK):%H:%M} МСК)\n"
+        f"Пик: {peak[1]} ({peak_t} МСК)\n"
+        f"Минимум: {low[1]} ({low_t} МСК)\n"
         f"Среднее: {avg}"
     )
     try:
@@ -956,7 +974,7 @@ async def show_graph(event):
 # ---------- экраны ----------
 
 
-async def build_screen(screen: str, uid: int, chat: int, force: bool = False):
+async def build_screen(screen, uid, chat, force=False):
     """Возвращает (текст, клавиатура, с_фото)."""
     if screen == "menu":
         return MENU_TEXT, screen_kb("menu", refresh=False, admin=(uid == ADMIN_ID)), True
@@ -999,7 +1017,9 @@ async def build_screen(screen: str, uid: int, chat: int, force: bool = False):
 
     if screen == "free":
         pairs = [(n, s) for n, s in enumerate(servers, 1) if num(s.get("online")) > 0]
-        pairs = sorted(pairs or list(enumerate(servers, 1)), key=lambda p: num(p[1].get("online")))[:10]
+        if not pairs:
+            pairs = list(enumerate(servers, 1))
+        pairs = sorted(pairs, key=lambda p: num(p[1].get("online")))[:10]
         lines = [fmt_num_line(n, s) for n, s in pairs]
         text = render_list("Самые свободные серверы:", lines, f"Общий онлайн: {total}", limit)
         return text, screen_kb("free"), photo
@@ -1022,7 +1042,7 @@ async def build_screen(screen: str, uid: int, chat: int, force: bool = False):
     return text, screen_kb("online"), photo
 
 
-async def show_screen(event, screen: str, force: bool = False):
+async def show_screen(event, screen, force=False):
     if screen == "graph":
         await show_graph(event)
         return
@@ -1030,14 +1050,14 @@ async def show_screen(event, screen: str, force: bool = False):
     await render(event, text, markup, photo)
 
 
-def card_kb(n: int) -> InlineKeyboardMarkup:
+def card_kb(n):
     return InlineKeyboardMarkup(inline_keyboard=[
         [btn("↻ Обновить", f"sr:{n}"), btn("☰ Все серверы", "nav:online")],
         [btn("← Назад", "nav:menu")],
     ])
 
 
-async def show_search(event, q: str):
+async def show_search(event, q):
     try:
         servers = await fetch_servers()
     except Exception:
@@ -1061,7 +1081,7 @@ async def show_search(event, q: str):
     await render(event, text, InlineKeyboardMarkup(inline_keyboard=rows), True)
 
 
-async def show_fav_edit(c: CallbackQuery, page: int):
+async def show_fav_edit(c, page):
     try:
         servers = await fetch_servers()
     except Exception:
@@ -1074,11 +1094,11 @@ async def show_fav_edit(c: CallbackQuery, page: int):
     page = min(max(page, 0), pages - 1)
     chunk = servers[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
-    buttons = [
-        btn(("★ " if num(s["id"]) in favs else "") + str(s.get("name", "?")),
-            f"ft:{num(s['id'])}:{page}")
-        for s in chunk
-    ]
+    buttons = []
+    for s in chunk:
+        sid = num(s["id"])
+        star = "★ " if sid in favs else ""
+        buttons.append(btn(f"{star}{s.get('name', '?')}", f"ft:{sid}:{page}"))
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     pager = []
     if page > 0:
@@ -1099,7 +1119,7 @@ async def show_fav_edit(c: CallbackQuery, page: int):
 # ---------- фоновые проверки ----------
 
 
-def build_digest_text(chat: int, servers: list[dict], now: datetime) -> str:
+def build_digest_text(chat, servers, now):
     by_id = {num(s.get("id")): s for s in servers if s.get("id") is not None}
     mine = [by_id[i] for i in sorted(get_favs(chat)) if i in by_id]
     stamp = now.strftime("%d.%m %H:%M")
@@ -1114,7 +1134,7 @@ def build_digest_text(chat: int, servers: list[dict], now: datetime) -> str:
     return render_list(title, lines, f"Общий онлайн: {total}", CAPTION_LIMIT)
 
 
-async def safe_push(chat: int, text: str, kb: InlineKeyboardMarkup | None) -> bool:
+async def safe_push(chat, text, kb):
     try:
         await push(chat, text, kb)
         return True
@@ -1125,7 +1145,7 @@ async def safe_push(chat: int, text: str, kb: InlineKeyboardMarkup | None) -> bo
     return False
 
 
-async def check_alerts(servers: list[dict]):
+async def check_alerts(servers):
     alerts = db.execute("SELECT * FROM alerts").fetchall()
     if not alerts:
         return
@@ -1140,9 +1160,10 @@ async def check_alerts(servers: list[dict]):
         cur = num(s.get("online"))
         hit = alert_hit(a["op"], cur, a["val"])
         word = "ниже" if a["op"] == "-" else "выше"
+        sname = html.escape(str(s.get("name", a["name"])))
         text = (
             "<b>Уведомление</b>\n"
-            f"{html.escape(str(s.get('name', a['name'])))}: онлайн {cur}, это {word} {a['val']}."
+            f"{sname}: онлайн {cur}, это {word} {a['val']}."
         )
         if a["repeat"]:
             if hit and a["armed"]:
@@ -1155,7 +1176,7 @@ async def check_alerts(servers: list[dict]):
                 run("DELETE FROM alerts WHERE id=?", (a["id"],))
 
 
-async def check_x2(servers: list[dict]):
+async def check_x2(servers):
     cur = {str(server_key(s)): bool(s.get("x2")) for s in servers}
     prev = dict(_x2_state)
     _x2_state.clear()
@@ -1174,15 +1195,16 @@ async def check_x2(servers: list[dict]):
         if k in prev and k in cur and prev[k] != cur[k]:
             s = by_key[k]
             state = "включён" if cur[k] else "выключен"
+            sname = html.escape(str(s.get("name", sub["name"])))
             text = (
                 "<b>x2</b>\n"
-                f"{html.escape(str(s.get('name', sub['name'])))}: x2 {state}. "
+                f"{sname}: x2 {state}. "
                 f"Онлайн: {num(s.get('online'))}/{num(s.get('max_online'))}."
             )
             await safe_push(sub["chat"], text, kb)
 
 
-async def check_digests(servers: list[dict]):
+async def check_digests(servers):
     now = datetime.now(MSK)
     today = now.strftime("%Y-%m-%d")
     rows = db.execute(
@@ -1236,7 +1258,7 @@ _ALERT_RE = re.compile(
 )
 
 
-async def resolve_server(m: Message, query: str, kb: InlineKeyboardMarkup):
+async def resolve_server(m, query, kb):
     """Находит один сервер по номеру/названию. Если не вышло, сам отвечает и возвращает None."""
     try:
         servers = await fetch_servers()
@@ -1276,7 +1298,7 @@ async def cmd_start(m: Message, command: CommandObject, is_new: bool = False):
 
 @dp.message(Command("online"))
 @dp.message(F.text.func(lambda t: t.strip().lower() == "онлайн"))
-async def cmd_online(m: Message, command: CommandObject | None = None):
+async def cmd_online(m: Message, command: CommandObject = None):
     arg = (command.args or "").strip() if command else ""
     if arg:
         await show_search(m, arg)
@@ -1446,7 +1468,7 @@ async def cmd_digest(m: Message, command: CommandObject):
         return
     chat = chat_of(m)
     kb = screen_kb("dg", refresh=False)
-    if arg in ("off", "выкл", "стоп", "0ff"):
+    if arg in ("off", "выкл", "стоп"):
         run("DELETE FROM digest WHERE chat=?", (chat,))
         await send_screen(m, "Ежедневная сводка выключена.", kb, True)
         return
@@ -1566,9 +1588,12 @@ async def main():
     task = None
     try:
         try:
-            BOT_USERNAME = (await bot.get_me()).username
+            me = await bot.get_me()
+            BOT_USERNAME = me.username
+            logging.info("Бот запущен: @%s", BOT_USERNAME)
+            await bot.delete_webhook(drop_pending_updates=False)
         except Exception:
-            logging.exception("get_me failed")
+            logging.exception("startup check failed (проверь BOT_TOKEN)")
         try:
             await set_commands()
         except Exception:
