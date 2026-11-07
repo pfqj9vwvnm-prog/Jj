@@ -17,7 +17,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_URL = os.getenv("API_URL", "https://blackrussia.online/api/gameservers/")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "15"))  # секунд
 PHOTO_PATH = os.getenv("PHOTO_PATH", "brtools.png")
-PHOTO_URL = os.getenv("PHOTO_URL", "")  # Прямая ссылка на баннер для прикрепления превью к длинному списку
+PHOTO_URL = os.getenv("PHOTO_URL", "")  # Прямая ссылка на фото (позволяет прикрепить фото к длинному тексту в 1 сообщение)
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -70,7 +70,8 @@ async def send_online(m: Message):
         servers = await fetch_servers()
         text = build_text(servers)
 
-        # 1. Если указана прямая ссылка на фото — прикрепляем баннер превью сверху текста (без ограничения длины)
+        # Вариант 1: Задана ссылка на фото (PHOTO_URL).
+        # Telegram прикрепляет фото сверху большим баннером В ОДНОМ сообщении без лимита на 1024 символа.
         if PHOTO_URL:
             await m.answer(
                 f'<a href="{PHOTO_URL}">&#8203;</a>' + text,
@@ -81,10 +82,16 @@ async def send_online(m: Message):
                     show_above_text=True,
                 ),
             )
-        # 2. Если локальный файл brtools.png есть и текст умещается в лимит подписи Telegram (1024 символа)
-        elif os.path.exists(PHOTO_PATH) and len(text) <= 1024:
-            await m.answer_photo(FSInputFile(PHOTO_PATH), caption=text)
-        # 3. Если серверов много (>1024 символов) и прямой ссылки нет — отдаём текст, чтобы избежать ошибки Telegram
+        # Вариант 2: Локальный файл brtools.png.
+        elif os.path.exists(PHOTO_PATH):
+            if len(text) <= 1024:
+                # Если текст влезает в лимит Telegram (до 1024 символов) — отправляем фото с подписью
+                await m.answer_photo(FSInputFile(PHOTO_PATH), caption=text)
+            else:
+                # Текст серверов длиннее 1024 символов. Чтобы фото не пропадало, отправляем фото и следом текст:
+                await m.answer_photo(FSInputFile(PHOTO_PATH))
+                await m.answer(text)
+        # Вариант 3: Фото нет вообще — отправляем только текст
         else:
             await m.answer(text)
     except Exception:
