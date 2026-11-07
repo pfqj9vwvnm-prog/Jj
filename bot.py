@@ -3,9 +3,7 @@ import html
 import logging
 import math
 import os
-import sqlite3
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -28,13 +26,11 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_URL = os.getenv("API_URL", "https://blackrussia.online/api/gameservers/")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "15"))  # секунд
-HISTORY_INTERVAL = int(os.getenv("HISTORY_INTERVAL", "300"))  # как часто писать историю
-DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 PHOTO_PATH = Path(__file__).parent / "brtools.png"
-CAPTION_LIMIT = 1024  # лимит Telegram на подпись к фото
+CAPTION_LIMIT = 1000  # лимит подписи к фото 1024, берём с запасом
+TEXT_LIMIT = 4000  # лимит текстового сообщения 4096, берём с запасом
 PAGE_SIZE = 15  # серверов на странице при выборе избранного
-MSK = timezone(timedelta(hours=3))
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -43,29 +39,7 @@ _cache = {"ts": 0.0, "data": None}
 _lock = asyncio.Lock()
 _session: aiohttp.ClientSession | None = None
 _photo_file_id: str | None = None
-
-# ---------- база (избранное и история) ----------
-
-db = sqlite3.connect(DB_PATH)
-db.execute(
-    "CREATE TABLE IF NOT EXISTS favs ("
-    "user_id INTEGER, server_id INTEGER, PRIMARY KEY (user_id, server_id))"
-)
-db.execute("CREATE TABLE IF NOT EXISTS history (ts INTEGER, total INTEGER)")
-db.commit()
-
-
-def get_favs(uid: int) -> set[int]:
-    rows = db.execute("SELECT server_id FROM favs WHERE user_id=?", (uid,))
-    return {r[0] for r in rows}
-
-
-def toggle_fav(uid: int, sid: int) -> None:
-    if sid in get_favs(uid):
-        db.execute("DELETE FROM favs WHERE user_id=? AND server_id=?", (uid, sid))
-    else:
-        db.execute("INSERT OR IGNORE INTO favs VALUES (?, ?)", (uid, sid))
-    db.commit()
+_favs: dict[int, set[int]] = {}  # избранное в памяти (сбрасывается при перезапуске)
 
 
 # ---------- данные ----------
@@ -113,8 +87,8 @@ def fmt_line(i: int, s: dict) -> str:
     return f"{i}. {name}: {num(s.get('online'))}/{num(s.get('max_online'))}{x}"
 
 
-def render_list(title: str, lines: list[str], footer: str) -> str:
-    """Список в раскрывающейся цитате. Если не влезает в подпись — обрезаем с конца."""
+def render_list(title: str, lines: list[str], footer: str, limit: int) -> str:
+    """Список в раскрывающейся цитате. Режет с конца, только если не влезает в limit."""
     if not lines:
         lines = ["—"]
     shown = len(lines)
@@ -122,7 +96,7 @@ def render_list(title: str, lines: list[str], footer: str) -> str:
         body = "\n".join(lines[:shown])
         if shown < len(lines):
             body += f"\n…и ещё {len(lines) - shown}"
-        if len(title) + len(body) + len(footer) + 2 <= CAPTION_LIMIT or shown == 0:
+        if len(title) + len(body) + len(footer) + 2 <= limit or shown == 0:
             break
         shown -= 1
     return (
@@ -132,69 +106,12 @@ def render_list(title: str, lines: list[str], footer: str) -> str:
     )
 
 
-def fmt_time(ts: int) -> str:
-    return datetime.fromtimestamp(ts, MSK).strftime("%H:%M")
-
-
-def build_stats(servers: list[dict]) -> str:
-    total = total_online(servers)
-    cnt = len(servers)
-    avg = total // cnt if cnt else 0
-    x2 = sum(1 for s in servers if s.get("x2"))
-    best = max(servers, key=lambda s: num(s.get("online")), default=None)
-
-    lines = [
-        "<b>Статистика</b>",
-        f"Серверов: {cnt}",
-        f"Общий онлайн: {total}",
-        f"Среднее на сервер: {avg}",
-        f"Серверов с x2: {x2}",
-    ]
-    if best:
-        lines.append(
-            f"Самый загруженный: {html.escape(str(best.get('name', '?')))} "
-            f"({num(best.get('online'))})"
-        )
-
-    rows = db.execute(
-        "SELECT ts, total FROM history WHERE ts >= ? ORDER BY ts",
-        (int(time.time()) - 86400,),
-    ).fetchall()
-    lines += ["", "<b>За 24 часа</b>"]
-    if len(rows) >= 2:
-        peak = max(rows, key=lambda r: r[1])
-        low = min(rows, key=lambda r: r[1])
-        mean = sum(r[1] for r in rows) // len(rows)
-        lines += [
-            f"Пик: {peak[1]} ({fmt_time(peak[0])} МСК)",
-            f"Минимум: {low[1]} ({fmt_time(low[0])} МСК)",
-            f"Среднее: {mean}",
-        ]
-    else:
-        lines.append("Данные ещё копятся, загляни позже.")
-    return "\n".join(lines)
-
-
-async def history_loop():
-    while True:
-        try:
-            servers = await fetch_servers()
-            now = int(time.time())
-            db.execute("INSERT INTO history VALUES (?, ?)", (now, total_online(servers)))
-            db.execute("DELETE FROM history WHERE ts < ?", (now - 7 * 86400,))
-            db.commit()
-        except Exception:
-            logging.exception("history failed")
-        await asyncio.sleep(HISTORY_INTERVAL)
-
-
 # ---------- кнопки ----------
 
 NAV = [
-    ("online", "📊 Все серверы"),
-    ("top", "🏆 Топ"),
-    ("fav", "⭐ Избранное"),
-    ("stats", "📈 Статистика"),
+    ("online", "☰ Все серверы"),
+    ("top", "▲ Топ"),
+    ("fav", "★ Избранное"),
 ]
 
 
@@ -206,12 +123,15 @@ def screen_kb(current: str, extra=None, refresh: bool = True) -> InlineKeyboardM
     rows = list(extra or [])
     items = [btn(label, f"nav:{key}") for key, label in NAV if key != current]
     if current == "menu":
-        items.append(btn("❓ Помощь", "nav:help"))
-    else:
-        items.append(btn("🏠 Меню", "nav:menu"))
+        items.append(btn("? Помощь", "nav:help"))
     rows += [items[i:i + 2] for i in range(0, len(items), 2)]
+    bottom = []
+    if current != "menu":
+        bottom.append(btn("← Назад", "nav:menu"))
     if refresh:
-        rows.append([btn("🔄 Обновить", f"rf:{current}")])
+        bottom.append(btn("↻ Обновить", f"rf:{current}"))
+    if bottom:
+        rows.append(bottom)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -222,50 +142,63 @@ HELP_TEXT = (
     "/online — онлайн всех серверов (или напиши «онлайн»)\n"
     "/top — топ серверов по онлайну\n"
     "/fav — избранные серверы\n"
-    "/stats — статистика\n"
     "/help — эта справка\n\n"
     f"Данные обновляются примерно раз в {CACHE_TTL} сек."
 )
 ERROR_TEXT = "Не удалось получить онлайн, попробуй позже."
 
 
-# ---------- отправка и редактирование (всегда одно сообщение с фото) ----------
+# ---------- отправка и редактирование ----------
 
 
-async def send_photo(m: Message, caption: str, markup: InlineKeyboardMarkup | None = None):
+async def send_screen(m: Message, text: str, markup: InlineKeyboardMarkup | None, photo: bool):
+    """Одно сообщение: либо фото с подписью, либо обычный текст."""
     global _photo_file_id
-    try:
-        photo = _photo_file_id or FSInputFile(PHOTO_PATH)
-        sent = await m.answer_photo(photo, caption=caption, reply_markup=markup)
-        if not _photo_file_id and sent.photo:
-            _photo_file_id = sent.photo[-1].file_id  # дальше шлём по file_id
-    except Exception:
-        _photo_file_id = None
-        logging.exception(
-            "answer_photo failed (path=%s, exists=%s)", PHOTO_PATH, PHOTO_PATH.exists()
-        )
-        await m.answer(caption, reply_markup=markup)  # запасной вариант, чтобы бот не молчал
+    if photo:
+        try:
+            src = _photo_file_id or FSInputFile(PHOTO_PATH)
+            sent = await m.answer_photo(src, caption=text, reply_markup=markup)
+            if not _photo_file_id and sent.photo:
+                _photo_file_id = sent.photo[-1].file_id  # дальше шлём по file_id
+            return
+        except Exception:
+            _photo_file_id = None
+            logging.exception(
+                "answer_photo failed (path=%s, exists=%s)", PHOTO_PATH, PHOTO_PATH.exists()
+            )
+    await m.answer(text, reply_markup=markup)  # запасной вариант, чтобы бот не молчал
 
 
-async def render(event, text: str, markup: InlineKeyboardMarkup | None):
-    if isinstance(event, CallbackQuery):
-        toast = None
-        msg = event.message
-        if isinstance(msg, Message):
-            try:
-                if msg.photo:
+async def render(event, text: str, markup: InlineKeyboardMarkup | None, photo: bool):
+    if not isinstance(event, CallbackQuery):
+        await send_screen(event, text, markup, photo)
+        return
+
+    toast = None
+    msg = event.message
+    if isinstance(msg, Message):
+        is_photo = bool(msg.photo)
+        try:
+            if is_photo == photo:
+                # тот же тип сообщения — правим на месте
+                if photo:
                     await msg.edit_caption(caption=text, reply_markup=markup)
                 else:
                     await msg.edit_text(text, reply_markup=markup)
-            except TelegramBadRequest as e:
-                if "not modified" in str(e):
-                    toast = "Ничего не изменилось"
-                else:
-                    logging.exception("edit failed")
-                    await send_photo(msg, text, markup)
-        await event.answer(toast)
-    else:
-        await send_photo(event, text, markup)
+            else:
+                # фото <-> текст редактированием не превратить: удаляем и шлём новое
+                try:
+                    await msg.delete()
+                except Exception:
+                    logging.exception("delete failed")
+                await send_screen(msg, text, markup, photo)
+        except TelegramBadRequest as e:
+            if "not modified" in str(e):
+                toast = "Ничего не изменилось"
+            else:
+                logging.exception("edit failed")
+                await send_screen(msg, text, markup, photo)
+    await event.answer(toast)
 
 
 def uid_of(event) -> int:
@@ -273,50 +206,52 @@ def uid_of(event) -> int:
 
 
 async def build_screen(screen: str, uid: int, force: bool = False):
+    """Возвращает (текст, клавиатура, с_фото)."""
     if screen == "menu":
-        return MENU_TEXT, screen_kb("menu", refresh=False)
+        return MENU_TEXT, screen_kb("menu", refresh=False), True
     if screen == "help":
-        return HELP_TEXT, screen_kb("help", refresh=False)
+        return HELP_TEXT, screen_kb("help", refresh=False), True
 
-    if screen not in ("top", "fav", "stats"):
+    if screen not in ("top", "fav"):
         screen = "online"
+    photo = screen != "online"  # у /online фото нет — иначе не влезут все серверы
 
     try:
         servers = await fetch_servers(force)
     except Exception:
         logging.exception("fetch failed")
-        return ERROR_TEXT, screen_kb(screen)
+        return ERROR_TEXT, screen_kb(screen), photo
 
     total = total_online(servers)
+    limit = CAPTION_LIMIT if photo else TEXT_LIMIT
 
     if screen == "top":
         best = sorted(servers, key=lambda s: num(s.get("online")), reverse=True)[:10]
         lines = [fmt_line(i, s) for i, s in enumerate(best, 1)]
-        return render_list("Топ по онлайну:", lines, f"Общий онлайн: {total}"), screen_kb("top")
-
-    if screen == "stats":
-        return build_stats(servers), screen_kb("stats")
+        text = render_list("Топ по онлайну:", lines, f"Общий онлайн: {total}", limit)
+        return text, screen_kb("top"), photo
 
     if screen == "fav":
         by_id = {num(s.get("id")): s for s in servers if s.get("id") is not None}
-        mine = [by_id[i] for i in sorted(get_favs(uid)) if i in by_id]
-        edit_row = [[btn("✏️ Изменить", "fe:0")]]
+        mine = [by_id[i] for i in sorted(_favs.get(uid, set())) if i in by_id]
+        edit_row = [[btn("✎ Изменить", "fe:0")]]
         if not mine:
             text = "<b>Избранное пусто.</b>\nНажми «Изменить», чтобы выбрать серверы."
         else:
             lines = [fmt_line(i, s) for i, s in enumerate(mine, 1)]
             fav_total = sum(num(s.get("online")) for s in mine)
-            text = render_list("Избранные серверы:", lines, f"Онлайн избранных: {fav_total}")
-        return text, screen_kb("fav", extra=edit_row)
+            text = render_list("Избранные серверы:", lines, f"Онлайн избранных: {fav_total}", limit)
+        return text, screen_kb("fav", extra=edit_row), photo
 
-    # online — текст такой же, как был раньше
+    # online — все серверы, обычным текстом
     lines = [fmt_line(i, s) for i, s in enumerate(servers, 1)]
-    return render_list("Онлайн серверов:", lines, f"Общий онлайн: {total}"), screen_kb("online")
+    text = render_list("Онлайн серверов:", lines, f"Общий онлайн: {total}", limit)
+    return text, screen_kb("online"), photo
 
 
 async def show_screen(event, screen: str, force: bool = False):
-    text, markup = await build_screen(screen, uid_of(event), force)
-    await render(event, text, markup)
+    text, markup, photo = await build_screen(screen, uid_of(event), force)
+    await render(event, text, markup, photo)
 
 
 async def show_fav_edit(c: CallbackQuery, page: int):
@@ -327,31 +262,31 @@ async def show_fav_edit(c: CallbackQuery, page: int):
         await c.answer("Не удалось загрузить список серверов", show_alert=True)
         return
     servers = [s for s in servers if s.get("id") is not None]
-    favs = get_favs(uid_of(c))
+    favs = _favs.get(uid_of(c), set())
     pages = max(1, math.ceil(len(servers) / PAGE_SIZE))
     page = min(max(page, 0), pages - 1)
     chunk = servers[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
 
     buttons = [
-        btn(("⭐ " if num(s["id"]) in favs else "") + str(s.get("name", "?")),
+        btn(("★ " if num(s["id"]) in favs else "") + str(s.get("name", "?")),
             f"ft:{num(s['id'])}:{page}")
         for s in chunk
     ]
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     pager = []
     if page > 0:
-        pager.append(btn("◀️", f"fe:{page - 1}"))
+        pager.append(btn("‹", f"fe:{page - 1}"))
     pager.append(btn(f"{page + 1}/{pages}", "noop"))
     if page < pages - 1:
-        pager.append(btn("▶️", f"fe:{page + 1}"))
+        pager.append(btn("›", f"fe:{page + 1}"))
     rows.append(pager)
-    rows.append([btn("✅ Готово", "nav:fav")])
+    rows.append([btn("← Назад", "nav:fav")])
 
     text = (
         "<b>Выбери серверы для избранного</b>\n"
-        f"Страница {page + 1}/{pages}. Нажми на сервер, чтобы добавить или убрать ⭐."
+        f"Страница {page + 1}/{pages}. Нажми на сервер, чтобы добавить или убрать ★."
     )
-    await render(c, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    await render(c, text, InlineKeyboardMarkup(inline_keyboard=rows), True)
 
 
 # ---------- команды ----------
@@ -377,11 +312,6 @@ async def cmd_top(m: Message):
 @dp.message(Command("fav"))
 async def cmd_fav(m: Message):
     await show_screen(m, "fav")
-
-
-@dp.message(Command("stats"))
-async def cmd_stats(m: Message):
-    await show_screen(m, "stats")
 
 
 @dp.message(Command("help"))
@@ -410,7 +340,8 @@ async def cb_fav_edit(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("ft:"))
 async def cb_fav_toggle(c: CallbackQuery):
     _, sid, page = c.data.split(":")
-    toggle_fav(uid_of(c), int(sid))
+    favs = _favs.setdefault(uid_of(c), set())
+    favs.symmetric_difference_update({int(sid)})
     await show_fav_edit(c, int(page))
 
 
@@ -428,7 +359,6 @@ async def set_commands():
         BotCommand(command="online", description="Все серверы"),
         BotCommand(command="top", description="Топ по онлайну"),
         BotCommand(command="fav", description="Избранное"),
-        BotCommand(command="stats", description="Статистика"),
         BotCommand(command="help", description="Помощь"),
     ])
 
@@ -441,17 +371,13 @@ async def main():
     )
     if not PHOTO_PATH.exists():
         logging.warning("brtools.png не найден: %s — ответы пойдут без фото", PHOTO_PATH)
-    task = None
     try:
         try:
             await set_commands()
         except Exception:
             logging.exception("set_my_commands failed")
-        task = asyncio.create_task(history_loop())
         await dp.start_polling(bot)
     finally:
-        if task:
-            task.cancel()
         await _session.close()
 
 
