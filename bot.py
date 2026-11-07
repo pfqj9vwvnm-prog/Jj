@@ -9,18 +9,14 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, LinkPreviewOptions, Message
+from aiogram.types import Message
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_URL = os.getenv("API_URL", "https://blackrussia.online/api/gameservers/")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "15"))  # секунд
-PHOTO_PATH = os.getenv("PHOTO_PATH", "brtools.png")
-
-# Если есть ссылка на баннер, бот прикрепит фото прямо сверху сообщения в 1 пузырь.
-# Если оставить пустым, бот сам автоматически загрузит brtools.png при старте.
-PHOTO_URL = os.getenv("PHOTO_URL", "")
+BRTOOLS_IMAGE_URL = os.getenv("BRTOOLS_IMAGE_URL", "")  # GitHub raw URL для brtools.png
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -28,39 +24,6 @@ dp = Dispatcher()
 _cache = {"ts": 0.0, "data": None}
 _lock = asyncio.Lock()
 _session: aiohttp.ClientSession | None = None
-
-
-async def get_photo_url() -> str:
-    """Возвращает прямую ссылку на фото. Если её нет, автоматически выгружает brtools.png на хостинг."""
-    global PHOTO_URL
-    if PHOTO_URL:
-        return PHOTO_URL
-    if not os.path.exists(PHOTO_PATH) or not _session:
-        return ""
-
-    for host in ["catbox", "0x0"]:
-        try:
-            data = aiohttp.FormData()
-            if host == "catbox":
-                data.add_field("reqtype", "fileupload")
-                with open(PHOTO_PATH, "rb") as f:
-                    data.add_field("fileToUpload", f.read(), filename="brtools.png")
-                url = "https://catbox.moe/user/api.php"
-            else:
-                with open(PHOTO_PATH, "rb") as f:
-                    data.add_field("file", f.read(), filename="brtools.png")
-                url = "https://0x0.st"
-
-            async with _session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    link = (await resp.text()).strip()
-                    if link.startswith("http"):
-                        PHOTO_URL = link
-                        logging.info("Баннер успешно загружен: %s", PHOTO_URL)
-                        return PHOTO_URL
-        except Exception as e:
-            logging.warning("Не удалось автоматически загрузить баннер на %s: %s", host, e)
-    return ""
 
 
 async def fetch_servers() -> list[dict]:
@@ -98,37 +61,38 @@ def build_text(servers: list[dict]) -> str:
     )
 
 
-@dp.message(CommandStart())
-@dp.message(Command("online"))
-@dp.message(F.text.func(lambda t: t.strip().lower() == "онлайн"))
 async def send_online(m: Message):
     try:
-        servers = await fetch_servers()
-        text = build_text(servers)
-        photo_url = await get_photo_url()
+        text = build_text(await fetch_servers())
 
-        # Прикрепляем фото прямо к сообщению (баннер сверху текста, ОДНО сообщение)
-        if photo_url:
-            await m.answer(
-                f'<a href="{photo_url}">&#8203;</a>' + text,
-                link_preview_options=LinkPreviewOptions(
-                    is_disabled=False,
-                    url=photo_url,
-                    prefer_large_media=True,
-                    show_above_text=True,
-                ),
-            )
-        elif os.path.exists(PHOTO_PATH):
-            if len(text) <= 1024:
-                await m.answer_photo(FSInputFile(PHOTO_PATH), caption=text)
-            else:
-                await m.answer_photo(FSInputFile(PHOTO_PATH))
+        # Telegram поддерживает URL изображения, в том числе GitHub raw.
+        # Если подпись слишком длинная, отправляем фото и текст отдельными сообщениями.
+        if BRTOOLS_IMAGE_URL:
+            try:
+                if len(text) <= 1024:
+                    await m.answer_photo(photo=BRTOOLS_IMAGE_URL, caption=text)
+                else:
+                    await m.answer_photo(photo=BRTOOLS_IMAGE_URL)
+                    await m.answer(text)
+            except Exception:
+                logging.exception("Не удалось отправить brtools.png, отправляю только текст")
                 await m.answer(text)
         else:
             await m.answer(text)
     except Exception:
         logging.exception("online failed")
         await m.answer("Не удалось получить онлайн, попробуй позже.")
+
+
+@dp.message(CommandStart())
+async def start(m: Message):
+    await send_online(m)
+
+
+@dp.message(Command("online"))
+@dp.message(F.text.func(lambda t: t.strip().lower() == "онлайн"))
+async def online(m: Message):
+    await send_online(m)
 
 
 async def main():
