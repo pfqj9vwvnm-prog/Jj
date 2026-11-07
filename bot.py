@@ -3,6 +3,7 @@ import html
 import logging
 import math
 import os
+import re
 import time
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -31,6 +32,7 @@ PHOTO_PATH = Path(__file__).parent / "brtools.png"
 CAPTION_LIMIT = 1000  # лимит подписи к фото 1024, берём с запасом
 TEXT_LIMIT = 4000  # лимит текстового сообщения 4096, берём с запасом
 PAGE_SIZE = 15  # серверов на странице при выборе избранного
+BIZ_PAGE_CHARS = 800  # символов списка бизнесов на одной странице (под подпись к фото)
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -42,7 +44,228 @@ _photo_file_id: str | None = None
 _favs: dict[int, set[int]] = {}  # избранное в памяти (сбрасывается при перезапуске)
 
 
-# ---------- данные ----------
+# ---------- бизнесы на карте ----------
+# Формат строки: Название (номер) - место    или    АЗС #номер - место
+# Чтобы добавить бизнес, просто допиши строку сюда.
+
+BIZ_RAW = '''
+Одежда (1) - г.Южный, около банка
+Одежда (5) - пгт.Батырево, около военкомата
+Одежда (9) - г.Арзамас, на перекрестке
+Одежда (56) - г.Арзамас, около офиса СК
+Одежда (67) - г.Лыткарино, напротив ФСБ
+Одежда (72) - п.Рублевка
+Одежда (120) - г.Нижегородск, около ГИБДД
+
+24/7 (3) - г.Южный, около СМИ, ближе к телевышке
+24/7 (6) - пгт.Батырево, около банка
+24/7 (8) - г.Арзамас
+24/7 (13) - г.Арзамас, около поста ГИБДД
+24/7 (15) - пгт.Батырево, около военкомата
+24/7 (16) - д.Гарель, АЗС
+24/7 (18) - г.Южный, около банка
+24/7 (20) - г.Южный, около УМВД
+24/7 (21) - г.Южный, около СМИ, ближе к гаражам
+24/7 (22) - д.Гарель, АЗС у низкого автосалона
+24/7 (23) - г.Арзамас, около технического центра
+24/7 (24) - г.Лыткарино, около ФСБ
+24/7 (25) - д.Корякино, АЗС
+24/7 (26) - пгт.Батырево, АЗС около кладмэна
+24/7 (36) - п.Егоровка, АЗС
+24/7 (39) - г.Южный, АЗС
+24/7 (40) - АЗС над казино
+24/7 (57) - г.Арзамас, около офиса СК
+24/7 (58) - г.Арзамас, "Пятёрочка"
+24/7 (63) - д.Бусаево
+24/7 (64) - г.Лыткарино - АЗС
+24/7 (66) - г.Лыткарино, около банка
+24/7 (71) - п.Рублевка
+24/7 (97) - г.Нижегородск, около стройки
+24/7 (98) - г.Нижегородск, около "ТЦ РИО"
+24/7 (99) - г.Нижегородск, около стадиона
+24/7 (100) - г.Нижегородск, около ГИБДД
+24/7 (101) - г.Нижегородск, около работы «электрик»
+24/7 (105) - г.Нижегородск, около кремля
+24/7 (106) - г.Нижегородск, около железнодорожного вокзала
+24/7 (107) - г.Нижегородск, около банка
+24/7 (108) - г.Нижегородск, около центральной развязки
+
+Аксессуары (31) - г.Южный, около банка
+Аксессуары (32) - г.Арзамас, на перекрестке
+Аксессуары (69) - г.Лыткарино, около банка
+Аксессуары (77) - пгт.Батырево, около Банка
+Аксессуары (113) - г.Нижегородск, "ТЦ РИО"
+Аксессуары (119) - г.Нижегородск, около центральной развязки
+
+Закусочная (2) - г.Южный, около СМИ
+Закусочная (4) - пгт.Батырево, около военкомата
+Закусочная (7) - пгт.Батырево, около воинской части
+Закусочная (11) - г.Арзамас
+Закусочная (12) - г.Арзамас, на перекрестке
+Закусочная (17) - г.Арзамас, старый вокзал
+Закусочная (37) - п.Егоровка
+Закусочная (68) - г.Лыткарино, около стройки
+Закусочная (109) - г.Нижегородск, около больницы
+Закусочная (114) - г.Нижегородск, "ТЦ РИО"
+
+Ларек (42) - г.Арзамас, ближе к старому спавну
+Ларек (43) - г.Арзамас, дальше от старого спавна
+Ларек (44) - г.Арзамас, "ДМЗ Хлеб"
+Ларек (45) - г.Арзамас, около офиса СК
+Ларек (46) - г.Арзамас, около больницы
+Ларек (47) - г.Лыткарино, вокзал
+Ларек (48) - пгт.Батырево, вокзал
+Ларек (49) - пгт.Батырево, около банка
+Ларек (50) - г.Южный, вокзал
+Ларек (52) - г.Южный, около банка
+Ларек (53) - г.Южный, около ГИБДД, на другой стороне дороги
+Ларек (54) - г.Южный, около ГИБДД
+Ларек (55) - г.Арзамас, вокзал
+Ларек (70) - г.Лыткарино, около Больницы
+Ларек (74) - п.Рублевка
+Ларек (110) - г.Нижегородск, морской вокзал
+
+Амуниция (14) - г.Арзамас, на перекрестке
+Амуниция (19) - г.Южный, около банка
+Амуниция (65) - г.Лыткарино, около банка
+Амуниция (73) - п.Рублевка
+Амуниция (76) - пгт.Батырево
+Амуниция (104) - г.Нижегородск, около центральной развязки
+Амуниция (118) - г.Нижегородск, около "ТЦ РИО"
+
+Клуб (62) - г.Арзамас, рядом с работой «Водолаз»
+
+Рыболовный магазин (78) - г.Южный
+Рыболовный магазин (79) - г.Арзамас
+Рыболовный магазин (80) - пгт.Батырево
+Рыболовный магазин (81) - г.Лыткарино
+
+Мастерская (83) - г.Арзамас
+Мастерская (84) - пгт.Батырево
+Мастерская (85) - д.Бусаево
+Мастерская (86) - г.Лыткарино
+Мастерская (87) - г.Южный
+Мастерская (103) - г.Нижегородск, около ГИБДД
+Мастерская (116) - г.Нижегородск, около стадиона
+
+Пункт выдачи заказа (88) - г.Арзамас, около gTAXI
+Пункт выдачи заказа (89) - г.Лыткарино, около вокзала
+Пункт выдачи заказа (90) - г.Арзамас, около "Пятерочка"
+Пункт выдачи заказа (91) - г.Лыткарино, около стройки
+Пункт выдачи заказа (92) - д.Бусаево
+Пункт выдачи заказа (93) - пгт.Батырево
+Пункт выдачи заказа (94) - г.Южный, около УМВД
+Пункт выдачи заказа (95) - г.Южный, около СМИ
+Пункт выдачи заказа (96) - п.Рублевка
+Пункт выдачи заказа (102) - г.Нижегородск, около ГИБДД
+Пункт выдачи заказа (112) - г.Нижегородск, "ТЦ РИО"
+
+Автосалон низкого класса (0) - г.Арзамас
+Автосалон среднего класса (27) - г.Арзамас, как ехать в г.Южный
+Автосалон высокого класса (28) - г.Арзамас, как ехать в пгт.Батырево
+Салон грузовых автомобилей (38) - около завода
+Мотосалон (41) - недалеко от п.Егоровка
+Мотосалон (51) - недалеко от п.Егоровка
+Лодочный салон (75) - г.Южный
+
+Стайлинг центр (33) - г.Южный
+Шиномонтажный центр (34) - пгт.Батырево
+Технический центр (35) - г.Арзамас
+
+Казино (30)
+
+АЗС #0 - г.Южный
+АЗС #1 - Бывший автосалон низкого класса
+АЗС #2 - Охота
+АЗС #3 - Автосалон низкого класса
+АЗС #4 - Кладмэн
+АЗС #5 - Егоровка
+АЗС #6 - г.Лыткарино
+АЗС #7 - над Казино
+АЗС #8 - Водная
+АЗС #9 - г.Нижегородск
+'''
+
+# (название раздела, с чего начинается название бизнеса)
+BIZ_CATEGORIES = [
+    ("Одежда", ("Одежда",)),
+    ("24/7", ("24/7",)),
+    ("Аксессуары", ("Аксессуары",)),
+    ("Закусочные", ("Закусочная",)),
+    ("Ларьки", ("Ларек",)),
+    ("Амуниция", ("Амуниция",)),
+    ("Рыболовные магазины", ("Рыболовный магазин",)),
+    ("Мастерские", ("Мастерская",)),
+    ("Пункты выдачи", ("Пункт выдачи заказа",)),
+    ("Салоны", ("Автосалон", "Салон", "Мотосалон", "Лодочный салон")),
+    ("Прочее", ("Клуб", "Стайлинг", "Шиномонтажный", "Технический центр", "Казино")),
+    ("АЗС", ("АЗС",)),
+]
+
+_BIZ_RE = re.compile(r"^(.+?)\s*(?:\((\d+)\)|#(\d+))\s*(?:-\s*(.*))?$")
+
+
+def _load_biz():
+    seen: dict[tuple[str, str], str] = {}
+    for raw in BIZ_RAW.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = _BIZ_RE.match(line)
+        if not m:
+            logging.warning("business line skipped: %s", line)
+            continue
+        name, n1, n2, place = m.groups()
+        tag = f"№{n1}" if n1 else f"#{n2}"
+        key = (name.strip(), tag)
+        if key not in seen:  # дубликаты отбрасываем
+            seen[key] = (place or "").strip()
+
+    cats, used = [], set()
+    for label, prefixes in BIZ_CATEGORIES:
+        items = []
+        for (name, tag), place in seen.items():
+            if (name, tag) not in used and name.startswith(prefixes):
+                items.append((name, tag, place))
+                used.add((name, tag))
+        items.sort(key=lambda e: int(e[1][1:]))
+        cats.append((label, items))
+    for key in seen:
+        if key not in used:
+            logging.warning("business without category: %s", key)
+
+    by_num: dict[int, list[tuple[str, str, str]]] = {}
+    for _, items in cats:
+        for name, tag, place in items:
+            if tag.startswith("№"):
+                by_num.setdefault(int(tag[1:]), []).append((name, tag, place))
+    return cats, by_num
+
+
+BIZ, BIZ_BY_NUM = _load_biz()
+
+
+def biz_line(entry: tuple[str, str, str], mixed: bool) -> str:
+    name, tag, place = entry
+    head = f"{name} {tag}" if mixed else tag
+    return f"{head} — {place}" if place else head
+
+
+def paginate(lines: list[str], limit: int) -> list[list[str]]:
+    pages, cur, size = [], [], 0
+    for ln in lines:
+        add = len(ln) + 1
+        if cur and size + add > limit:
+            pages.append(cur)
+            cur, size = [], 0
+        cur.append(ln)
+        size += add
+    if cur:
+        pages.append(cur)
+    return pages or [[]]
+
+
+# ---------- данные серверов ----------
 
 
 def num(v) -> int:
@@ -112,6 +335,7 @@ NAV = [
     ("online", "☰ Все серверы"),
     ("top", "▲ Топ"),
     ("fav", "★ Избранное"),
+    ("biz", "◈ Бизнес на карте"),
 ]
 
 
@@ -142,10 +366,15 @@ HELP_TEXT = (
     "/online — онлайн всех серверов (или напиши «онлайн»)\n"
     "/top — топ серверов по онлайну\n"
     "/fav — избранные серверы\n"
+    "/business — бизнес на карте (или /business 57 — поиск по номеру)\n"
     "/help — эта справка\n\n"
     f"Данные обновляются примерно раз в {CACHE_TTL} сек."
 )
 ERROR_TEXT = "Не удалось получить онлайн, попробуй позже."
+BIZ_TEXT = (
+    "<b>Бизнес на карте</b>\n"
+    "Выбери тип бизнеса или отправь /business и номер, например /business 57."
+)
 
 
 # ---------- отправка и редактирование ----------
@@ -205,12 +434,50 @@ def uid_of(event) -> int:
     return event.from_user.id if event.from_user else 0
 
 
+def biz_kb() -> InlineKeyboardMarkup:
+    btns = [btn(f"{label} ({len(items)})", f"bc:{i}:0") for i, (label, items) in enumerate(BIZ)]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([btn("← Назад", "nav:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_biz_cat(ci: int, page: int):
+    label, items = BIZ[ci]
+    mixed = len({e[0] for e in items}) > 1
+    pages = paginate([biz_line(e, mixed) for e in items], BIZ_PAGE_CHARS)
+    page = min(max(page, 0), len(pages) - 1)
+    body = "\n".join(html.escape(ln) for ln in pages[page])
+    text = f"<b>{html.escape(label)}</b> ({len(items)})\n{body}"
+
+    rows = []
+    if len(pages) > 1:
+        text += f"\n\nСтраница {page + 1}/{len(pages)}"
+        pager = []
+        if page > 0:
+            pager.append(btn("‹", f"bc:{ci}:{page - 1}"))
+        pager.append(btn(f"{page + 1}/{len(pages)}", "noop"))
+        if page < len(pages) - 1:
+            pager.append(btn("›", f"bc:{ci}:{page + 1}"))
+        rows.append(pager)
+    rows.append([btn("← Назад", "nav:biz")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def show_biz_cat(event, ci: int, page: int):
+    if not 0 <= ci < len(BIZ):
+        ci = 0
+    text, markup = build_biz_cat(ci, page)
+    await render(event, text, markup, True)
+
+
 async def build_screen(screen: str, uid: int, force: bool = False):
     """Возвращает (текст, клавиатура, с_фото)."""
     if screen == "menu":
         return MENU_TEXT, screen_kb("menu", refresh=False), True
     if screen == "help":
         return HELP_TEXT, screen_kb("help", refresh=False), True
+    if screen == "biz":
+        return BIZ_TEXT, biz_kb(), True
 
     if screen not in ("top", "fav"):
         screen = "online"
@@ -319,6 +586,21 @@ async def cmd_help(m: Message):
     await show_screen(m, "help")
 
 
+@dp.message(Command("business"))
+async def cmd_business(m: Message, command: CommandObject):
+    arg = (command.args or "").strip().lstrip("№#").strip()
+    if not arg:
+        await show_screen(m, "biz")
+        return
+    back = InlineKeyboardMarkup(inline_keyboard=[[btn("← Назад", "nav:biz")]])
+    if arg.isdigit() and int(arg) in BIZ_BY_NUM:
+        lines = [biz_line(e, True) for e in BIZ_BY_NUM[int(arg)]]
+        text = "<b>Найдено:</b>\n" + "\n".join(html.escape(ln) for ln in lines)
+    else:
+        text = f"Бизнес «{html.escape(arg)}» не найден. Отправь номер, например /business 57."
+    await send_screen(m, text, back, True)
+
+
 # ---------- инлайн-кнопки ----------
 
 
@@ -330,6 +612,12 @@ async def cb_nav(c: CallbackQuery):
 @dp.callback_query(F.data.startswith("rf:"))
 async def cb_refresh(c: CallbackQuery):
     await show_screen(c, c.data.split(":", 1)[1], force=True)
+
+
+@dp.callback_query(F.data.startswith("bc:"))
+async def cb_biz_cat(c: CallbackQuery):
+    _, ci, page = c.data.split(":")
+    await show_biz_cat(c, num(ci), num(page))
 
 
 @dp.callback_query(F.data.startswith("fe:"))
@@ -359,6 +647,7 @@ async def set_commands():
         BotCommand(command="online", description="Все серверы"),
         BotCommand(command="top", description="Топ по онлайну"),
         BotCommand(command="fav", description="Избранное"),
+        BotCommand(command="business", description="Бизнес на карте"),
         BotCommand(command="help", description="Помощь"),
     ])
 
