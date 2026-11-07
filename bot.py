@@ -17,7 +17,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_URL = os.getenv("API_URL", "https://blackrussia.online/api/gameservers/")
 CACHE_TTL = int(os.getenv("CACHE_TTL", "15"))  # секунд
 PHOTO_PATH = os.getenv("PHOTO_PATH", "brtools.png")
-PHOTO_URL = os.getenv("PHOTO_URL", "")  # Прямая ссылка на баннер для отправки большим превью
+PHOTO_URL = os.getenv("PHOTO_URL", "")  # Прямая ссылка на баннер для прикрепления превью к длинному списку
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -63,22 +63,14 @@ def build_text(servers: list[dict]) -> str:
 
 
 @dp.message(CommandStart())
-async def start(m: Message):
-    text = "Привет! Отправь /online, чтобы узнать онлайн серверов Black Russia."
-    if os.path.exists(PHOTO_PATH):
-        await m.answer_photo(FSInputFile(PHOTO_PATH), caption=text)
-    else:
-        await m.answer(text)
-
-
 @dp.message(Command("online"))
 @dp.message(F.text.func(lambda t: t.strip().lower() == "онлайн"))
-async def online(m: Message):
+async def send_online(m: Message):
     try:
         servers = await fetch_servers()
         text = build_text(servers)
 
-        # 1. Если указана прямая ссылка на фото — прикрепляем его большим превью сверху текста (без ограничения длины)
+        # 1. Если указана прямая ссылка на фото — прикрепляем баннер превью сверху текста (без ограничения длины)
         if PHOTO_URL:
             await m.answer(
                 f'<a href="{PHOTO_URL}">&#8203;</a>' + text,
@@ -89,10 +81,10 @@ async def online(m: Message):
                     show_above_text=True,
                 ),
             )
-        # 2. Если файл brtools.png лежит рядом и текст умещается в лимит подписи Telegram (1024 символа)
+        # 2. Если локальный файл brtools.png есть и текст умещается в лимит подписи Telegram (1024 символа)
         elif os.path.exists(PHOTO_PATH) and len(text) <= 1024:
             await m.answer_photo(FSInputFile(PHOTO_PATH), caption=text)
-        # 3. Если серверов много (>1024 символов) и ссылки нет — отправляем текстом, чтобы Telegram не выдал ошибку
+        # 3. Если серверов много (>1024 символов) и прямой ссылки нет — отдаём текст, чтобы избежать ошибки Telegram
         else:
             await m.answer(text)
     except Exception:
