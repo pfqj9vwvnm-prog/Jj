@@ -1,5 +1,6 @@
 import asyncio
 import html
+import itertools
 import logging
 import math
 import os
@@ -11,7 +12,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -33,6 +34,8 @@ CAPTION_LIMIT = 1000  # лимит подписи к фото 1024, берём �
 TEXT_LIMIT = 4000  # лимит текстового сообщения 4096, берём с запасом
 PAGE_SIZE = 15  # серверов на странице при выборе избранного
 BIZ_PAGE_CHARS = 800  # символов списка бизнесов на одной странице (под подпись к фото)
+MAX_ALERTS = 10  # уведомлений на один чат
+ALERT_CHECK_EVERY = max(10, CACHE_TTL)  # как часто проверять уведомления, сек
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -42,6 +45,8 @@ _lock = asyncio.Lock()
 _session: aiohttp.ClientSession | None = None
 _photo_file_id: str | None = None
 _favs: dict[int, set[int]] = {}  # избранное в памяти (сбрасывается при перезапуске)
+_alerts: list[dict] = []  # уведомления в памяти (сбрасываются при перезапуске)
+_alert_ids = itertools.count(1)
 
 
 # ---------- бизнесы на карте ----------
@@ -300,6 +305,10 @@ async def fetch_servers(force: bool = False) -> list[dict]:
         return data
 
 
+def server_key(s: dict):
+    return s.get("id") if s.get("id") is not None else s.get("name")
+
+
 def total_online(servers: list[dict]) -> int:
     return sum(num(s.get("online")) for s in servers)
 
@@ -336,6 +345,7 @@ NAV = [
     ("top", "▲ Топ"),
     ("fav", "★ Избранное"),
     ("biz", "◈ Бизнес на карте"),
+    ("msg", "◉ Уведомления"),
 ]
 
 
@@ -367,6 +377,8 @@ HELP_TEXT = (
     "/top — топ серверов по онлайну\n"
     "/fav — избранные серверы\n"
     "/business — бизнес на карте (или /business 57 — поиск по номеру)\n"
+    "/message 90 -1300 — сообщить, когда онлайн сервера №90 станет меньше 1300 "
+    "(+ вместо - — когда станет больше)\n"
     "/help — эта справка\n\n"
     f"Данные обновляются примерно раз в {CACHE_TTL} сек."
 )
@@ -374,6 +386,12 @@ ERROR_TEXT = "Не удалось получить онлайн, попробу�
 BIZ_TEXT = (
     "<b>Бизнес на карте</b>\n"
     "Выбери тип бизнеса или отправь /business и номер, например /business 57."
+)
+ALERT_HELP = (
+    "Сообщу один раз, когда онлайн сервера станет выше или ниже порога.\n"
+    "/message 90 -1300 — онлайн сервера №90 станет меньше 1300\n"
+    "/message 90 +1300 — онлайн сервера №90 станет больше 1300\n"
+    "Номер сервера такой же, как в списке /online."
 )
 
 
@@ -396,6 +414,23 @@ async def send_screen(m: Message, text: str, markup: InlineKeyboardMarkup | None
                 "answer_photo failed (path=%s, exists=%s)", PHOTO_PATH, PHOTO_PATH.exists()
             )
     await m.answer(text, reply_markup=markup)  # запасной вариант, чтобы бот не молчал
+
+
+async def push(chat_id: int, text: str, markup: InlineKeyboardMarkup | None = None):
+    """Сообщение без входящего Message (для уведомлений): фото с подписью."""
+    global _photo_file_id
+    try:
+        src = _photo_file_id or FSInputFile(PHOTO_PATH)
+        sent = await bot.send_photo(chat_id, src, caption=text, reply_markup=markup)
+        if not _photo_file_id and sent.photo:
+            _photo_file_id = sent.photo[-1].file_id
+        return
+    except TelegramForbiddenError:
+        raise
+    except Exception:
+        _photo_file_id = None
+        logging.exception("send_photo failed (path=%s, exists=%s)", PHOTO_PATH, PHOTO_PATH.exists())
+    await bot.send_message(chat_id, text, reply_markup=markup)
 
 
 async def render(event, text: str, markup: InlineKeyboardMarkup | None, photo: bool):
@@ -434,6 +469,12 @@ def uid_of(event) -> int:
     return event.from_user.id if event.from_user else 0
 
 
+def chat_of(event) -> int:
+    if isinstance(event, CallbackQuery):
+        return event.message.chat.id if event.message else uid_of(event)
+    return event.chat.id
+
+
 def biz_kb() -> InlineKeyboardMarkup:
     btns = [btn(f"{label} ({len(items)})", f"bc:{i}:0") for i, (label, items) in enumerate(BIZ)]
     rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
@@ -468,6 +509,142 @@ async def show_biz_cat(event, ci: int, page: int):
         ci = 0
     text, markup = build_biz_cat(ci, page)
     await render(event, text, markup, True)
+
+
+# ---------- уведомления об онлайне ----------
+
+
+def alert_hit(op: str, cur: int, val: int) -> bool:
+    return cur < val if op == "-" else cur > val
+
+
+def alert_label(a: dict) -> str:
+    sign = "<" if a["op"] == "-" else ">"
+    return f"✕ {a['name']} №{a['num']} {sign} {a['val']}"
+
+
+def build_alerts(chat: int):
+    mine = [a for a in _alerts if a["chat"] == chat]
+    if mine:
+        head = f"Активных: {len(mine)}/{MAX_ALERTS}. Нажми на уведомление, чтобы удалить."
+    else:
+        head = "Активных уведомлений нет."
+    text = f"<b>Уведомления</b>\n{ALERT_HELP}\n\n{head}"
+    rows = [[btn(alert_label(a), f"ad:{a['id']}")] for a in mine]
+    return text, screen_kb("msg", extra=rows, refresh=False)
+
+
+async def notify(a: dict, cur: int):
+    word = "ниже" if a["op"] == "-" else "выше"
+    text = (
+        "<b>Уведомление</b>\n"
+        f"{html.escape(a['name'])} (№{a['num']}): онлайн {cur}, это {word} {a['val']}."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn("☰ Все серверы", "nav:online"), btn("◉ Уведомления", "nav:msg")],
+    ])
+    await push(a["chat"], text, kb)
+
+
+async def alerts_loop():
+    while True:
+        await asyncio.sleep(ALERT_CHECK_EVERY)
+        if not _alerts:
+            continue
+        try:
+            servers = await fetch_servers(force=True)
+        except Exception:
+            logging.exception("alerts fetch failed")
+            continue
+        by_key = {server_key(s): s for s in servers}
+        for a in list(_alerts):
+            s = by_key.get(a["key"])
+            if s is None:
+                continue
+            cur = num(s.get("online"))
+            if not alert_hit(a["op"], cur, a["val"]):
+                continue
+            try:
+                await notify(a, cur)
+            except TelegramForbiddenError:
+                # пользователь заблокировал бота — убираем все его уведомления
+                _alerts[:] = [x for x in _alerts if x["chat"] != a["chat"]]
+                continue
+            except Exception:
+                logging.exception("notify failed, will retry")
+                continue
+            if a in _alerts:
+                _alerts.remove(a)
+
+
+_ALERT_RE = re.compile(r"^№?(\d+)\s+([+\-−–<>])\s*(\d+)$")
+
+
+@dp.message(Command("message"))
+async def cmd_message(m: Message, command: CommandObject):
+    args = (command.args or "").strip()
+    if not args:
+        await show_screen(m, "msg")
+        return
+
+    kb = screen_kb("msg", refresh=False)
+    mt = _ALERT_RE.match(args)
+    if not mt:
+        await send_screen(m, "Не понял. Пример: /message 90 -1300\n\n" + ALERT_HELP, kb, True)
+        return
+
+    n = int(mt.group(1))
+    op = "-" if mt.group(2) in "-−–<" else "+"
+    val = int(mt.group(3))
+    word = "меньше" if op == "-" else "больше"
+
+    try:
+        servers = await fetch_servers()
+    except Exception:
+        logging.exception("fetch failed")
+        await send_screen(m, "Не удалось получить список серверов, попробуй позже.", kb, True)
+        return
+    if not 1 <= n <= len(servers):
+        await send_screen(m, f"Сервера №{n} нет. Всего серверов: {len(servers)}.", kb, True)
+        return
+
+    s = servers[n - 1]
+    name = str(s.get("name", "?"))
+    cur = num(s.get("online"))
+    safe = html.escape(name)
+
+    if alert_hit(op, cur, val):
+        text = (
+            f"Уже выполнено: на {safe} (№{n}) сейчас {cur}, это {word} {val}. "
+            "Задай другой порог."
+        )
+        await send_screen(m, text, kb, True)
+        return
+
+    chat = chat_of(m)
+    key = server_key(s)
+    mine = [a for a in _alerts if a["chat"] == chat]
+    if any(a["key"] == key and a["op"] == op and a["val"] == val for a in mine):
+        await send_screen(m, "Такое уведомление уже есть.", kb, True)
+        return
+    if len(mine) >= MAX_ALERTS:
+        await send_screen(
+            m, f"Лимит уведомлений: {MAX_ALERTS}. Удали ненужные в разделе «Уведомления».", kb, True
+        )
+        return
+
+    _alerts.append({
+        "id": next(_alert_ids), "chat": chat, "key": key,
+        "num": n, "name": name, "op": op, "val": val,
+    })
+    text = (
+        f"Готово. Сообщу один раз, когда онлайн {safe} (№{n}) станет {word} {val}. "
+        f"Сейчас: {cur}."
+    )
+    await send_screen(m, text, kb, True)
+
+
+# ---------- экраны ----------
 
 
 async def build_screen(screen: str, uid: int, force: bool = False):
@@ -517,6 +694,10 @@ async def build_screen(screen: str, uid: int, force: bool = False):
 
 
 async def show_screen(event, screen: str, force: bool = False):
+    if screen == "msg":
+        text, markup = build_alerts(chat_of(event))
+        await render(event, text, markup, True)
+        return
     text, markup, photo = await build_screen(screen, uid_of(event), force)
     await render(event, text, markup, photo)
 
@@ -620,6 +801,14 @@ async def cb_biz_cat(c: CallbackQuery):
     await show_biz_cat(c, num(ci), num(page))
 
 
+@dp.callback_query(F.data.startswith("ad:"))
+async def cb_alert_del(c: CallbackQuery):
+    aid = num(c.data.split(":")[1])
+    chat = chat_of(c)
+    _alerts[:] = [a for a in _alerts if not (a["id"] == aid and a["chat"] == chat)]
+    await show_screen(c, "msg")
+
+
 @dp.callback_query(F.data.startswith("fe:"))
 async def cb_fav_edit(c: CallbackQuery):
     await show_fav_edit(c, num(c.data.split(":")[1]))
@@ -648,6 +837,7 @@ async def set_commands():
         BotCommand(command="top", description="Топ по онлайну"),
         BotCommand(command="fav", description="Избранное"),
         BotCommand(command="business", description="Бизнес на карте"),
+        BotCommand(command="message", description="Уведомление об онлайне"),
         BotCommand(command="help", description="Помощь"),
     ])
 
@@ -660,13 +850,17 @@ async def main():
     )
     if not PHOTO_PATH.exists():
         logging.warning("brtools.png не найден: %s — ответы пойдут без фото", PHOTO_PATH)
+    task = None
     try:
         try:
             await set_commands()
         except Exception:
             logging.exception("set_my_commands failed")
+        task = asyncio.create_task(alerts_loop())
         await dp.start_polling(bot)
     finally:
+        if task:
+            task.cancel()
         await _session.close()
 
 
